@@ -1,129 +1,196 @@
 #!/usr/bin/env python3
-import argparse, os, time, signal, sys, csv
+import os, time, csv, signal, sys, math, json, argparse
 from datetime import datetime
-from picamera2 import Picamera2
+
+# --- Enviro+ sensors ---
+from enviroplus import gas
+from bme280 import BME280
+from ltr559 import LTR559
+try:
+    from pms5003 import PMS5003, ReadTimeoutError
+    PMS_AVAILABLE = True
+except Exception:
+    PMS_AVAILABLE = False
+
+# Some Pi images expose CPU temp here:
+def read_cpu_temp_c():
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
+            return int(f.read().strip()) / 1000.0
+    except Exception:
+        return float("nan")
 
 stop = False
 def handle_sigint(sig, frame):
     global stop
     stop = True
 signal.signal(signal.SIGINT, handle_sigint)
+signal.signal(signal.SIGTERM, handle_sigint)
+
+def compensate_temp(raw_temp_c, cpu_temp_c, factor=0.6):
+    """Simple CPU-heat compensation heuristic."""
+    if math.isnan(cpu_temp_c):
+        return raw_temp_c
+    return raw_temp_c - (cpu_temp_c - raw_temp_c) * factor
+
+def open_csv(path, fieldnames):
+    new = not os.path.exists(path)
+    f = open(path, "a", newline="")
+    w = csv.DictWriter(f, fieldnames=fieldnames)
+    if new:
+        w.writeheader()
+    return f, w
 
 def main():
-    p = argparse.ArgumentParser(description="Raspberry Pi HQ Camera timelapse")
-    p.add_argument("--outdir", default="timelapse_out", help="Output directory")
-    p.add_argument("--interval", type=float, default=10.0, help="Seconds between shots")
-    p.add_argument("--duration", type=float, default=0.0,
-                   help="Total runtime in seconds (0 = until Ctrl+C or --frames reached)")
-    p.add_argument("--frames", type=int, default=0, help="Stop after N frames (0 = ignore)")
-    p.add_argument("--width", type=int, default=4056, help="Capture width")
-    p.add_argument("--height", type=int, default=3040, help="Capture height")
-    p.add_argument("--quality", type=int, default=90, help="JPEG quality (1-100)")
-    p.add_argument("--iso", type=int, default=0, help="ISO (0 = auto)")
-    p.add_argument("--shutter_us", type=int, default=0, help="Shutter speed in microseconds (0 = auto)")
-    p.add_argument("--awb", default="auto", help="AWB mode: auto/daylight/cloudy/tungsten/fluorescent")
-    p.add_argument("--exposure", default="auto", help="Exposure mode: auto/normal/sport/short/long")
-    p.add_argument("--annotate", default="", help="Text overlay in filename (not on image)")
-    p.add_argument("--no-video", action="store_true", help="Skip MP4 render at the end")
-    p.add_argument("--video-fps", type=int, default=24, help="MP4 frames per second")
-    p.add_argument("--video-name", default="timelapse.mp4", help="Output MP4 filename")
-    args = p.parse_args()
+    ap = argparse.ArgumentParser(description="Enviro+ CSV logger")
+    ap.add_argument("--interval", type=float, default=2.0, help="Seconds between reads")
+    ap.add_argument("--outdir", default="enviro_logs", help="Folder for CSV output")
+    ap.add_argument("--basename", default="enviro_readings", help="CSV filename stem")
+    ap.add_argument("--csv-rotate-min", type=int, default=0,
+                    help="Rotate CSV every N minutes (0 = single file)")
+    ap.add_argument("--temp-comp", action="store_true",
+                    help="Apply CPU-heat temp compensation")
+    ap.add_argument("--comp-factor", type=float, default=0.6,
+                    help="Compensation factor (0..1), higher = more correction")
+    ap.add_argument("--pms", action="store_true",
+                    help="Enable PMS5003 particulate if connected (auto-off by default)")
+    ap.add_argument("--print-json", action="store_true",
+                    help="Print each row as compact JSON to stdout")
+    args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
-    meta_path = os.path.join(args.outdir, "frames.csv")
-    with open(meta_path, "w", newline="") as csvf:
-        writer = csv.writer(csvf)
-        writer.writerow(["index","timestamp_iso","filename"])
 
-    picam2 = Picamera2()
-    config = picam2.create_still_configuration(
-        main={"size": (args.width, args.height), "format": "RGB888"},
-        buffer_count=2
-    )
-    picam2.configure(config)
+    # Init sensors
+    bme = BME280()         # I2C 0x76/0x77 (auto)
+    ltr = LTR559()         # I2C 0x23
+    has_pms = False
+    pms = None
 
-    # Camera controls
-    controls = {}
-    if args.iso > 0:
-        controls["AnalogueGain"] = max(1.0, args.iso / 100.0)  # rough mapping
-    if args.shutter_us > 0:
-        controls["ExposureTime"] = int(args.shutter_us)
-    # AWB/Exposure modes (best-effort)
-    awb_map = {
-        "auto":"auto","daylight":"daylight","cloudy":"cloudy","tungsten":"tungsten","fluorescent":"fluorescent"
-    }
-    if args.awb in awb_map:
-        controls["AwbEnable"] = True
-        controls["AwbMode"] = awb_map[args.awb]
-    exp_map = {"auto":"normal","normal":"normal","sport":"sport","short":"short","long":"long"}
-    if args.exposure in exp_map:
-        controls["AeEnable"] = (args.exposure == "auto" or args.exposure == "normal")
-        controls["ExposureMode"] = exp_map[args.exposure]
+    if args.pms and PMS_AVAILABLE:
+        try:
+            pms = PMS5003()
+            # wake & give sensor a moment to stabilize
+            time.sleep(1.0)
+            has_pms = True
+        except Exception as e:
+            print(f"[WARN] PMS5003 not available: {e}", file=sys.stderr)
+            has_pms = False
+    elif args.pms and not PMS_AVAILABLE:
+        print("[WARN] pms5003 library unavailable; skipping PM readings.", file=sys.stderr)
 
-    picam2.start()
-    if controls:
-        picam2.set_controls(controls)
-
+    # CSV setup
+    base_fields = [
+        "timestamp_iso", "uptime_s",
+        "temperature_c", "temperature_raw_c", "cpu_temp_c",
+        "humidity_pct", "pressure_hpa",
+        "light_lux", "proximity",
+        "gas_oxidising_kohm", "gas_reducing_kohm", "gas_nh3_kohm",
+    ]
+    pm_fields = ["pm1_0", "pm2_5", "pm10"]
+    fieldnames = base_fields + (pm_fields if has_pms else [])
+    csv_path = None
+    csv_file = None
+    writer = None
     start = time.monotonic()
-    next_shot = start
-    count = 0
+    last_rotate = time.monotonic()
+
+    def rotate_csv():
+        nonlocal csv_path, csv_file, writer, last_rotate
+        if csv_file:
+            csv_file.flush()
+            csv_file.close()
+        timestr = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = os.path.join(args.outdir, f"{args.basename}_{timestr}.csv")
+        csv_file, writer = open_csv(csv_path, fieldnames)
+        last_rotate = time.monotonic()
+        print(f"[INFO] Logging to {csv_path}")
+
+    # open first csv
+    rotate_csv()
+
+    # Read loop
     try:
-        while True:
-            now = time.monotonic()
-            if now >= next_shot:
-                count += 1
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-                tag = f"_{args.annotate}" if args.annotate else ""
-                fname = f"img_{ts}{tag}.jpg"
-                fpath = os.path.join(args.outdir, fname)
-                picam2.capture_file(fpath, quality=args.quality)
+        while not stop:
+            now_iso = datetime.now().isoformat()
+            uptime = time.monotonic() - start
 
-                # Append metadata row
-                with open(meta_path, "a", newline="") as csvf:
-                    writer = csv.writer(csvf)
-                    writer.writerow([count, datetime.now().isoformat(), fname])
+            # BME280
+            raw_temp = bme.get_temperature()          # °C (over-reads near CPU)
+            cpu_temp = read_cpu_temp_c()
+            temp_c = compensate_temp(raw_temp, cpu_temp, args.comp_factor) if args.temp_comp else raw_temp
+            humidity = bme.get_humidity()             # %
+            pressure = bme.get_pressure()             # hPa
 
-                print(f"[{count}] saved {fpath}")
+            # LTR559
+            try:
+                light = ltr.get_lux()                 # lux
+            except Exception:
+                light = float("nan")
+            prox = ltr.get_proximity()                # arbitrary units
 
-                next_shot += args.interval
+            # Gas (MICS6814)
+            gas_readings = gas.read_all()             # returns .oxidising, .reducing, .nh3 (Ohms)
+            # Convert Ohms→kΩ for readability
+            g_ox = gas_readings.oxidising / 1000.0
+            g_red = gas_readings.reducing / 1000.0
+            g_nh3 = gas_readings.nh3 / 1000.0
 
-            # Exit conditions
-            if stop:
-                print("Stopping (SIGINT).")
-                break
-            if args.frames > 0 and count >= args.frames:
-                print("Reached frame limit.")
-                break
-            if args.duration > 0 and (now - start) >= args.duration:
-                print("Reached duration limit.")
-                break
+            row = {
+                "timestamp_iso": now_iso,
+                "uptime_s": round(uptime, 3),
+                "temperature_c": round(temp_c, 3),
+                "temperature_raw_c": round(raw_temp, 3),
+                "cpu_temp_c": round(cpu_temp, 3) if not math.isnan(cpu_temp) else "",
+                "humidity_pct": round(humidity, 3),
+                "pressure_hpa": round(pressure, 3),
+                "light_lux": round(light, 3) if not math.isnan(light) else "",
+                "proximity": int(prox),
+                "gas_oxidising_kohm": round(g_ox, 3),
+                "gas_reducing_kohm": round(g_red, 3),
+                "gas_nh3_kohm": round(g_nh3, 3),
+            }
 
-            time.sleep(0.01)
+            # PMS5003 (optional)
+            if has_pms:
+                try:
+                    pm = pms.read()
+                    row.update({
+                        "pm1_0": pm.pm_ug_per_m3(1.0),
+                        "pm2_5": pm.pm_ug_per_m3(2.5),
+                        "pm10":  pm.pm_ug_per_m3(10),
+                    })
+                except ReadTimeoutError:
+                    # Keep last PM values blank if timeout
+                    row.update({"pm1_0": "", "pm2_5": "", "pm10": ""})
+                except Exception as e:
+                    # On serious error, disable PM until restart
+                    print(f"[WARN] PMS error: {e}; disabling PM reads.", file=sys.stderr)
+                    has_pms = False
+
+            # Write CSV
+            writer.writerow(row)
+            csv_file.flush()
+
+            # Optional JSON print
+            if args.print-json:
+                print(json.dumps(row, separators=(",", ":")), flush=True)
+
+            # Rotation
+            if args.csv_rotate_min > 0:
+                if (time.monotonic() - last_rotate) >= args.csv_rotate_min * 60:
+                    rotate_csv()
+
+            # Sleep
+            t_end = time.monotonic() + args.interval
+            while time.monotonic() < t_end:
+                if stop:
+                    break
+                time.sleep(0.02)
     finally:
-        picam2.stop()
-
-    # Optional video render
-    if not args.no-video and count > 0:
-        # Use file creation order via glob sorted by name (timestamped)
-        print("Rendering MP4…")
-        # Safer to write a list file for ffmpeg
-        listfile = os.path.join(args.outdir, "frames.txt")
-        import glob
-        imgs = sorted(glob.glob(os.path.join(args.outdir, "img_*.jpg")))
-        with open(listfile, "w") as f:
-            for im in imgs:
-                f.write(f"file '{os.path.basename(im)}'\n")
-        # Run ffmpeg
-        mp4_path = os.path.join(args.outdir, args.video_name)
-        cmd = (
-            f"ffmpeg -y -r {args.video_fps} -f concat -safe 0 -i {listfile} "
-            f"-vf 'format=yuv420p' -pix_fmt yuv420p -movflags +faststart {mp4_path}"
-        )
-        rc = os.system(cmd)
-        if rc == 0:
-            print(f"MP4 saved: {mp4_path}")
-        else:
-            print("ffmpeg render failed — you can run the command printed above manually.")
+        if csv_file:
+            csv_file.flush()
+            csv_file.close()
+        print("\n[INFO] Logger stopped.")
 
 if __name__ == "__main__":
     main()
